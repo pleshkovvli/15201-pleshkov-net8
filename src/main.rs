@@ -1,8 +1,11 @@
 extern crate mio;
 
 mod token_gen;
+mod http_connection;
+mod proxy;
 
 use token_gen::TokenGen;
+use http_connection::HttpConnection;
 
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -46,7 +49,7 @@ fn main() {
 
     let mut events = Events::with_capacity(MAX_CONNECTIONS_COUNT);
 
-    let mut connections: HashMap<Token, Rc<RefCell<Connection>>> = HashMap::new();
+    let mut connections: HashMap<Token, Rc<RefCell<HttpConnection>>> = HashMap::new();
 
     loop {
         match poll.poll(&mut events, None) {
@@ -61,7 +64,7 @@ fn main() {
             let token = event.token();
 
             if token == server_token {
-                handle_server_event(&r_host, &listener, &poll, &mut token_gen, &mut connections);
+                handle_server_event(&listener, &poll, &mut token_gen, &mut connections);
             } else {
                 match handle_client_event(event, token, &poll, &mut connections) {
                     Some(tokens) => {
@@ -72,5 +75,85 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+
+fn handle_server_event(
+    listener: &TcpListener,
+    poll: &Poll,
+    token_gen: &mut TokenGen,
+    connections: &mut HashMap<Token, Rc<RefCell<HttpConnection>>>,
+) {
+    let client: TcpStream = match listener.accept() {
+        Ok(result) => result.0,
+        Err(e) => {
+            eprintln!("Accept client error: {}", e);
+            return;
+        }
+    };
+
+    if connections.len() >= MAX_CONNECTIONS_COUNT {
+        return;
+    }
+
+    let client_token = token_gen.next_token();
+
+    poll.register(&client, client_token, Ready::readable(), PollOpt::level())
+        .expect("Failed to register tcp stream");
+
+    let connection = HttpConnection::new(
+        TokenStream {
+            stream: client,
+            token: client_token,
+        }
+    );
+
+    let rc_connection = Rc::new(RefCell::new(connection));
+    connections.insert(client_token, Rc::clone(&rc_connection));
+}
+
+fn sock_addr_ip_unspecified(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(<Ipv4Addr>::unspecified()), port)
+}
+
+
+fn handle_client_event(
+    event: Event,
+    token: Token,
+    poll: &Poll,
+    connections: &mut HashMap<Token, Rc<RefCell<HttpConnection>>>,
+) -> Option<(Token, Token)> {
+    let mut connection = match connections.get(&token) {
+        Some(ref connection) => connection.borrow_mut(),
+        None => return None,
+    };
+
+    let tokens = connection.tokens();
+
+    let ready: Option<(TokenReady, TokenReady)> = match connection.handle_event(token, event) {
+        Ok(result) => match result {
+            ConnectionResult::Continue(token, other) => Some((token, other)),
+            ConnectionResult::Close => {
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("Connection broken: {}", e);
+            None
+        }
+    };
+
+    match ready {
+        Some(values) => {
+            poll.reregister(values.0.stream, values.0.token, values.0.ready, PollOpt::level())
+                .expect("Failed to register");
+
+            poll.reregister(values.1.stream, values.1.token, values.1.ready, PollOpt::level())
+                .expect("Failed to register");
+
+            None
+        }
+        None => Some(tokens)
     }
 }

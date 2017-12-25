@@ -1,0 +1,7 @@
+[package]
+name = "net8"
+version = "0.1.0"
+authors = ["pleshkovvli <pleshkovvli@gmail.com>"]
+
+[dependencies]
+mio = "0.6"
